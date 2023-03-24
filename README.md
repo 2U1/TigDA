@@ -1,10 +1,5 @@
 # TigDA
 
-This repository contains project for class Application and Practice in Neural Networks<br>
-
-This project is for detecting disease through endoscopy image.
-<br>
-
 This code is based on mmsegmentation
 
 ## Overview
