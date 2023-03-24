@@ -22,6 +22,8 @@ This code is based on mmsegmentation
  |HRDA|73.8|65.8|
  |HRDA + Ours|74.2|67.0|
 
+ ![performance](imgs/performance.png)
+
 ## Usage
 
 ### environments
