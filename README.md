@@ -29,9 +29,8 @@ This code is based on mmsegmentation
 - torch >= 1.8.0
 - torchvision
 - mmcv-full
-- clip=1.0
+- clip==1.0
 - tqdm
-- pandas
 
 To use this code, please first install the 'mmcv-full' by following the official guideline guidelines ([`mmcv`](https://github.com/open-mmlab/mmcv/blob/master/README.md)).
 
