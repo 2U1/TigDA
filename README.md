@@ -67,7 +67,8 @@ python tools/convert_datasets/synthia.py /your/path/
 
 ### Training
 For convenience, provides and [annotated config file](configs/daformer/gta2cs_uda_pseudoclip_context.py) of the adaptation model
-
+Before training the data path in the config file[datset config file](configs/_base_/datasets) should be modifed with your data path.
+ 
 A training job can be launched using:
 
 ```shell
