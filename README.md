@@ -60,9 +60,9 @@ sh tools/download_checkpoints.sh
 ### Preprocessing the dataset
 The following dataset is preprocessed in COCO format , but if you are using the raw json file you can preprocess with the script
 ```shell
-python tools/convert_datasets/gta.py /your/path/.py
-python tools/convert_datasets/cityscapes.py /your/path/.py
-python tools/convert_datasets/synthia.py /your/path/.py
+python tools/convert_datasets/gta.py /your/path/
+python tools/convert_datasets/cityscapes.py /your/path/
+python tools/convert_datasets/synthia.py /your/path/
 ```
 
 ### Training
