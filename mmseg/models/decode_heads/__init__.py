@@ -1,6 +1,3 @@
-# Obtained from: https://github.com/open-mmlab/mmsegmentation/tree/v0.16.0
-# Modifications: Add additional decode_heads
-
 from .aspp_head import ASPPHead
 from .da_head import DAHead
 from .daformer_head import DAFormerHead
@@ -12,14 +9,10 @@ from .segformer_head import SegFormerHead
 from .sep_aspp_head import DepthwiseSeparableASPPHead
 from .uper_head import UPerHead
 from .heads import IdentityHead
-from .clip_head import CLIPHead
 from .fpn_head import FPNHead
-from .clip_head_oa import CLIPHeadOA
-from .lseg_head import LsegHead
-from .lseg_head_context import LsegHeadContext
-from .attention_head_context import AttentionHeadContext
+from .cmf_head import CMFHead
+from .cmf_head_context import CMFHeadContext
 from .dlv2_head_clip import DLV2HeadCLIP
-from .bert_head import BertHead
 
 __all__ = [
     'FCNHead',
@@ -33,12 +26,8 @@ __all__ = [
     'DAFormerHead',
     'ISAHead',
     'IdentityHead',
-    'CLIPHead',
     'FPNHead',
-    'CLIPHeadOA',
-    'LsegHead',
-    'LsegHeadContext',
-    'AttentionHeadContext',
     'DLV2HeadCLIP',
-    'BertHead'
+    'CMFHead',
+    'CMFHeadContext'
 ]

@@ -5,8 +5,8 @@
 
 import torch
 import torch.nn as nn
-from mmcv.cnn import ConvModule, DepthwiseSeparableConvModule
 import torch.nn.functional as F
+from mmcv.cnn import ConvModule, DepthwiseSeparableConvModule
 
 from mmseg.models.decode_heads.isa_head import ISALayer
 from mmseg.ops import resize
@@ -16,9 +16,9 @@ from .decode_head import BaseDecodeHead
 from .segformer_head import MLP
 from .sep_aspp_head import DepthwiseSeparableASPPModule
 import numpy as np
-import clip
 from collections import OrderedDict
 import math
+import clip
 
 
 class TextEncoder(nn.Module):
@@ -28,15 +28,13 @@ class TextEncoder(nn.Module):
         self.positional_embedding = clip_model.positional_embedding
         self.ln_final = clip_model.ln_final
         self.text_projection = clip_model.text_projection
-        # self.text_projection = nn.Parameter(torch.empty(clip_model.transformer.width, embed_dim))
-        self.token_embedding = clip_model.token_embedding
+        self.text_projection = nn.Parameter(torch.empty(clip_model.transformer.width, embed_dim))
         self.dtype = clip_model.dtype
 
-        # self.intialize_parameters(clip_model)
+        self.intialize_parameters(clip_model)
 
-    def forward(self, prompts):
-        x = self.token_embedding(prompts).type(self.dtype)
-        x = x + self.positional_embedding.type(self.dtype)
+    def forward(self, prompts, tokenized_prompts):
+        x = prompts + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
@@ -44,12 +42,106 @@ class TextEncoder(nn.Module):
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[torch.arange(x.shape[0]), prompts.argmax(dim=-1)] @ self.text_projection
+        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+
         return x
-    
+
     def intialize_parameters(self, clip_model):
         if self.text_projection is not None:
             nn.init.normal_(self.text_projection, std = clip_model.transformer.width ** -0.5)
+
+class PromptLearner(nn.Module):
+    def __init__(self, n_ctx, classnames, ctx_init, clip_model, vis_dim):
+        super().__init__()
+        n_cls = len(classnames)
+        n_ctx = n_ctx
+        dtype = clip_model.dtype
+        ctx_dim = clip_model.ln_final.weight.shape[0]
+        # cfg_imsize = cfg.INPUT.SIZE[0]
+
+
+        if ctx_init:
+            ctx_init = ctx_init.replace("_", " ")
+            n_ctx = len(ctx_init.split())
+            prompt = clip.tokenize(ctx_init)
+            with torch.no_grad():
+                embedding = clip_model.token_embedding(prompt).type(dtype)
+            ctx_vectors = embedding[0, 1 : 1+n_ctx, :]
+            prompt_prefix = ctx_init
+
+        else:
+            # random initialization
+            ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+            nn.init.normal_(ctx_vectors, std=0.02)
+            prompt_prefix = " ".join(["X"] * n_ctx)
+
+        print(f'Initial context: "{prompt_prefix}"')
+        print(f"Number of context words (tokens): {n_ctx}")
+
+        self.ctx = nn.Parameter(ctx_vectors)
+
+        self.meta_net = nn.Sequential(OrderedDict([
+            ("linear1", nn.Linear(vis_dim, vis_dim // 16)),
+            ("relu", nn.ReLU(inplace=True)),
+            ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
+        ]))
+        
+        classnames = [name.replace("_", " ") for name in classnames]
+        prompts = [prompt_prefix + " " + name + "." for name in classnames]
+
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])  # (n_cls, n_tkn)
+        with torch.no_grad():
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+
+        # These token vectors will be saved when in save_model(),
+        # but they should be ignored in load_model() as we want to use
+        # those computed using the current class names
+        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
+
+        self.n_cls = n_cls
+        self.n_ctx = n_ctx
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+    
+    def construct_prompts(self, ctx, prefix, suffix, label=None):
+        # dim0 is either batch_size (during training) or n_cls (during testing)
+        # ctx: context tokens, with shape of (dim0, n_ctx, ctx_dim)
+        # prefix: the sos token, with shape of (n_cls, 1, ctx_dim)
+        # suffix: remaining tokens, with shape of (n_cls, *, ctx_dim)
+
+        if label is not None:
+            prefix = prefix[label]
+            suffix = suffix[label]
+
+        prompts = torch.cat(
+            [
+                prefix,  # (dim0, 1, dim)
+                ctx,     # (dim0, n_ctx, dim)
+                suffix,  # (dim0, *, dim)
+            ],
+            dim=1,
+        )
+
+        return prompts
+
+    def forward(self, im_features):
+        prefix = self.token_prefix
+        suffix = self.token_suffix
+        ctx = self.ctx                     # (n_ctx, ctx_dim)
+        bias = self.meta_net(im_features)  # (batch, ctx_dim)
+        bias = bias.unsqueeze(1)           # (batch, 1, ctx_dim)
+        ctx = ctx.unsqueeze(0)             # (1, n_ctx, ctx_dim)
+        ctx_shifted = ctx + bias           # (batch, n_ctx, ctx_dim)
+        
+        # Use instance-conditioned context tokens for all classes
+        prompts = []
+        for ctx_shifted_i in ctx_shifted:
+            ctx_i = ctx_shifted_i.unsqueeze(0).expand(self.n_cls, -1, -1)
+            pts_i = self.construct_prompts(ctx_i, prefix, suffix)  # (n_cls, n_tkn, ctx_dim)
+            prompts.append(pts_i)
+        prompts = torch.stack(prompts)
+        
+        return prompts
 
 
 class depthwise_conv(nn.Module):
@@ -102,104 +194,6 @@ class bottleneck_block(nn.Module):
         if act:
             x = self.activation(x)
         return x
-
-# class Attention(nn.Module):
-#     def __init__(self, d_model, input_dims=None):
-#         super(Attention, self).__init__()
-#         self.d_model = d_model
-#         if input_dims is None:
-#             self.q_linear = nn.Linear(d_model, d_model)
-#             self.k_linear = nn.Linear(d_model, d_model)
-#             self.v_linear = nn.Linear(d_model, d_model)
-
-#         else:
-#             self.q_linear = nn.Linear(input_dims[0], d_model)
-#             self.k_linear = nn.Linear(input_dims[1], d_model)
-#             self.v_linear = nn.Linear(input_dims[2], d_model)
-
-#         self.out = nn.Linear(d_model, d_model)
-
-#         self.d_k = d_model
-    
-#     def forward(self, q, k, v):
-#         k = self.k_linear(k)
-#         q = self.q_linear(q)
-#         v = self.v_linear(v)
-        
-#         attention_score = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.d_k)
-#         attention_prob = torch.softmax(attention_score, dim=-1)
-#         out = torch.matmul(attention_prob, v)
-
-#         out = self.out(out)
-
-#         return out
-
-class Attention(nn.Module):
-    def __init__(self, img_dim, text_dim):
-        super(Attention, self).__init__()
-
-        self.d_img = img_dim
-        self.d_txt = text_dim
-
-        self.q_embed = nn.Conv2d(self.d_img, self.d_img, kernel_size=1)
-        self.k_embed = nn.Conv1d(self.d_txt, self.d_img, kernel_size=1)
-        self.v_embed = nn.Conv1d(self.d_txt, self.d_img, kernel_size=1)
-
-        self.visual_embed = nn.Conv2d(self.d_img, self.d_img, kernel_size=1)
-        self.fused_embed = nn.Conv2d(self.d_img, self.d_img, kernel_size=1)
-
-        self.out = nn.Conv2d(self.d_img, self.d_img, kernel_size=1)
-
-        self.instance_q = nn.InstanceNorm2d(self.d_img, affine=True)
-        self.instance_w = nn.InstanceNorm2d(self.d_img, affine=True)
-
-        self.d_k = img_dim
-    
-    def forward(self, vis, txt_k, txt_v):
-        
-        img_shape = vis.shape
-
-        k = txt_k.permute(0, 2, 1)
-        v = txt_v.permute(0, 2, 1)
-
-        visual_feat = F.relu(self.visual_embed(vis.clone()))
-        
-        q = self.instance_q(self.q_embed(vis.clone()))
-        k = self.k_embed(k)
-        v = self.v_embed(v)
-
-        q = q.view(img_shape[0], img_shape[1], -1).permute(0, 2, 1)
-        
-        attention_score = torch.matmul(q, k) / np.sqrt(self.d_k)
-        attention_prob = torch.softmax(attention_score, dim=-1)
-        v = v.permute(0, 2, 1)
-        fused = torch.matmul(attention_prob, v)
-
-        fused = fused.permute(0,2,1).view(img_shape[0], img_shape[1], img_shape[2], img_shape[3])
-        fused = self.instance_w(self.fused_embed(fused))
-
-        out = F.relu(self.out(visual_feat * fused))
-
-        return out
-
-class TwoLayerNet(nn.Module):
-    def __init__(self,C_in):
-        super().__init__()
-        self.conv1=nn.Conv2d(C_in,C_in,1)
-        self.conv2=nn.Conv2d(C_in,C_in,1)
-    
-    def forward(self,feat):
-        return torch.tanh(self.conv2(F.relu(self.conv1(feat))))
-
-
-class LanguagePath(nn.Module):
-    def __init__(self,C_in):
-        super().__init__()
-        self.twoLayerNet=TwoLayerNet(C_in)
-    def forward(self, vis_feat, fusion_feat):
-        S=self.twoLayerNet(fusion_feat)
-        return fusion_feat*S+vis_feat
-
 
 
 class ASPPWrapper(nn.Module):
@@ -312,29 +306,44 @@ def convert_models_to_fp32(model):
 
 
 @HEADS.register_module()
-class CLIPHead(BaseDecodeHead):
-    def __init__(self, class_names, tau, **kwargs):
+class CMFHeadContext(BaseDecodeHead):
+    def __init__(self, class_names, tau, arch_option, block_depth, activation, input_resolution, n_ctx, ctx_init, **kwargs):
         self.class_names = class_names
         self.tau = tau
-        super(CLIPHead, self).__init__(
+        super(CMFHeadContext, self).__init__(
             input_transform='multiple_select', **kwargs)
 
-        # self.clip_text_encoder, _ = clip.load('ViT-B/32' ,jit=False)
-        clip_model , _ = clip.load('RN50x16', device='cpu', jit=False)
-        text_dim = clip_model.transformer.width
+        # clip_model, _ = clip.load('ViT-B/16', device='cpu', jit=False)
+        clip_model, _ = clip.load('RN50x16', device='cpu', jit=False)
         convert_models_to_fp32(clip_model)
-        
-        for p in clip_model.parameters():
-            p.requires_grad = False
 
+        for idx in range(len(self.class_names)):
+            if self.class_names[idx] == 'person':
+                self.class_names[idx] = 'pedestrian'
+            elif self.class_names[idx] == 'rider':
+                self.class_names[idx] = 'driver'
+            elif self.class_names[idx] == 'bicycle':
+                self.class_names[idx] = 'bike'
+            elif self.class_names[idx] == 'motorcycle':
+                self.class_names[idx] = 'scooter'
+        last_channel = self.in_channels[-1]
         decoder_params = kwargs['decoder_params']
         embed_dims = decoder_params['embed_dims']
         final_embed_dim = embed_dims
-        
-        
-        self.clip_text_encoder = TextEncoder(clip_model, final_embed_dim)
-        self.attn = Attention(final_embed_dim, text_dim)
-        self.LG = LanguagePath(final_embed_dim)
+
+        for p in clip_model.parameters():
+            p.requires_grad = False
+
+        self.prompt_learner = PromptLearner(n_ctx, self.class_names, ctx_init, clip_model, final_embed_dim)
+        self.text_encoder = TextEncoder(clip_model, final_embed_dim)
+
+        self.block_depth = block_depth
+
+        self.arch_option = arch_option
+        if self.arch_option ==1:
+            self.spatial_block = bottleneck_block(activation=activation)
+        elif self.arch_option ==2:
+            self.spatial_block = depthwise_block(activation=activation)
 
         assert not self.align_corners
         if isinstance(embed_dims, int):
@@ -361,23 +370,13 @@ class CLIPHead(BaseDecodeHead):
 
         self.fuse_layer = build_layer(
             sum(embed_dims), self.channels, **fusion_cfg)
-
-        # if the class name is 'person', change the name to 'pedestrain'
-        # self.class_names = [name if name != 'person' else 'pedestrian' for name in self.class_names]
-        for idx in range(len(self.class_names)):
-            if self.class_names[idx] == 'person':
-                self.class_names[idx] = 'pedestrian'
-            elif self.class_names[idx] == 'bicycle':
-                self.class_names[idx] = 'bike'
-            elif self.class_names[idx] == 'motorcycle':
-                self.class_names[idx] = 'motorbike'
         
-        prompts = [f"a photo of a {name}." for name in self.class_names]
-
-        self.text = clip.tokenize(prompts)
-        
-        self.transformer_width = self.clip_text_encoder.transformer.width
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / self.tau)).exp()
+        self.linear_image = nn.Conv2d(last_channel, last_channel, input_resolution // 32)
+        
+
+        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        self.conv_seg = nn.Conv2d(self.channels + self.num_classes, self.num_classes, 1)
 
         del clip_model
 
@@ -386,8 +385,6 @@ class CLIPHead(BaseDecodeHead):
         n, _, h, w = x[-1].shape
         # for f in x:
         #     mmcv.print_log(f'{f.shape}', 'mmseg')
-
-        # self.logit_scale = self.logit_scale.to(x.device)
 
         os_size = x[0].size()[2:]
         _c = {}
@@ -405,68 +402,88 @@ class CLIPHead(BaseDecodeHead):
                     size=os_size,
                     mode='bilinear',
                     align_corners=self.align_corners)
-        
+        img_vector = self.linear_image(x[-1]).view(n, -1)
         x = self.fuse_layer(torch.cat(list(_c.values()), dim=1))
-        cross_attentioned_x = self.image_text_attention(x)
-        # x = x + cross_attentioned_x
-        # x = self.LG(x, cross_attentioned_x)
-        out = torch.cat([x, cross_attentioned_x], dim=1)
-        out = self.cls_seg(out)
+        x = self.cls_seg(x, img_vector)
 
         return x
 
+    def return_embed(self, inputs):
+        x = inputs
+        n, _, h, w = x[-1].shape
+        # for f in x:
+        #     mmcv.print_log(f'{f.shape}', 'mmseg')
 
-    def image_text_attention(self, feat):
+        os_size = x[0].size()[2:]
+        _c = {}
+        for i in self.in_index:
+            # mmcv.print_log(f'{i}: {x[i].shape}', 'mmseg')
+            _c[i] = self.embed_layers[str(i)](x[i])
+            if _c[i].dim() == 3:
+                _c[i] = _c[i].permute(0, 2, 1).contiguous()\
+                    .reshape(n, -1, x[i].shape[2], x[i].shape[3])
+            # mmcv.print_log(f'_c{i}: {_c[i].shape}', 'mmseg')
+            _c[i] = resize(
+                _c[i],
+                size=os_size,
+                mode='bilinear',
+                align_corners=self.align_corners)
+            # mmcv.print_log(f'_c{i}: {_c[i].shape}', 'mmseg')
+
+        x = self.fuse_layer(torch.cat(list(_c.values()), dim=1))
+
+        return x
+
+    def cls_seg(self, feat, img_vector):
         """Classify each pixel."""
+        # if self.dropout is not None:
+        #     feat = self.dropout(feat)
+
+        tokenized_prompts = self.tokenized_prompts.to(feat.device)
+
+        self.logit_scale = self.logit_scale.to(feat.device)
+
+        prompts = self.prompt_learner(img_vector)
+        
+        logits = []
+        
+        for pts_i, imf_i in zip(prompts, feat):
+            imf_shape = imf_i.shape
+            imf_orig = imf_i
+            imf_i = imf_i.permute(1, 2, 0).reshape(-1, imf_shape[0])
+            imf_i = imf_i / imf_i.norm(dim=-1, keepdim=True)
+            
+            text_features = self.text_encoder(pts_i, tokenized_prompts)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            
+            logits_per_image = self.logit_scale * imf_i @ text_features.t()
+            
+            
+            logit = logits_per_image.view(imf_shape[1], imf_shape[2], -1).permute(2, 0, 1)
+            
+            logit = logit.unsqueeze(0)
+            if self.arch_option in [1,2]:
+                for _ in range(self.block_depth - 1):
+                    logit = self.spatial_block(logit)
+                logit = self.spatial_block(logit, False)
+            logit = logit.squeeze(0)
+            
+            concated = torch.cat([imf_orig, logit], dim=0)
+            logits.append(concated)
+            # logits.append(logit)
+
+        out = torch.stack(logits)
+
+        # out = self.convproj(out)
+        
+        # if self.arch_option in [1,2]:
+        #     for _ in range(self.block_depth - 1):
+        #         out = self.spatial_block(out)
+        #     out = self.spatial_block(out, False)
+
         if self.dropout is not None:
-            feat = self.dropout(feat)
+            out = self.dropout(out)
 
-        text = self.text.to(feat.device)
-        # self.logit_scale = self.logit_scale.to(feat.device)
-
-        with torch.no_grad():
-            self.clip_text_encoder.eval()
-            text_features = self.clip_text_encoder(text)
-
-        imshape = feat.shape
-        # image_features = feat.permute(0, 2, 3, 1).reshape(-1, imshape[1])
-        # image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        # text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-
-        # logits_per_image = self.logit_scale * image_features @ text_features.t()
-        text_features = torch.stack([text_features]* imshape[0])
-        logits_per_image = self.attn(feat, text_features, text_features)
-        # logits_per_image *= self.logit_scale  
-
-        # out = logits_per_image.view(imshape[0], imshape[2], imshape[3], -1).permute(0, 3, 1, 2)
+        out = self.conv_seg(out)
         
-        return logits_per_image
-
-
-    # def cls_seg(self, feat):
-    #     """Classify each pixel."""
-    #     if self.dropout is not None:
-    #         feat = self.dropout(feat)
-
-    #     text = self.text.to(feat.device)
-    #     self.logit_scale = self.logit_scale.to(feat.device)
-
-    #     with torch.no_grad():
-    #         self.clip_text_encoder.eval()
-    #         text_features = self.clip_text_encoder(text)
-
-    #     imshape = feat.shape
-    #     image_features = feat.permute(0, 2, 3, 1).reshape(-1, imshape[1])
-    #     image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-    #     text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-
-    #     logits_per_image = self.logit_scale * image_features @ text_features.t()
-
-    #     out = logits_per_image.view(imshape[0], imshape[2], imshape[3], -1).permute(0, 3, 1, 2)
-        
-    #     if self.arch_option in [1,2]:
-    #         for _ in range(self.block_depth - 1):
-    #             out = self.spatial_block(out)
-    #         out = self.spatial_block(out, False)
-        
-    #     return out
+        return out

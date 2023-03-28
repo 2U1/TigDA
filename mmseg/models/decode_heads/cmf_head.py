@@ -1,7 +1,7 @@
-# # ---------------------------------------------------------------
-# # Copyright (c) 2021-2022 ETH Zurich, Lukas Hoyer. All rights reserved.
-# # Licensed under the Apache License, Version 2.0
-# # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# Copyright (c) 2021-2022 ETH Zurich, Lukas Hoyer. All rights reserved.
+# Licensed under the Apache License, Version 2.0
+# ---------------------------------------------------------------
 
 import torch
 import torch.nn as nn
@@ -14,10 +14,42 @@ from .aspp_head import ASPPModule
 from .decode_head import BaseDecodeHead
 from .segformer_head import MLP
 from .sep_aspp_head import DepthwiseSeparableASPPModule
-from transformers import BertTokenizer, BertModel
 import numpy as np
+import clip
 from collections import OrderedDict
 import math
+
+
+class TextEncoder(nn.Module):
+    def __init__(self, clip_model, embed_dim):
+        super().__init__()
+        self.transformer = clip_model.transformer
+        self.positional_embedding = clip_model.positional_embedding
+        self.ln_final = clip_model.ln_final
+        # self.text_projection = clip_model.text_projection
+        self.text_projection = nn.Parameter(torch.empty(clip_model.transformer.width, embed_dim))
+        self.token_embedding = clip_model.token_embedding
+        self.dtype = clip_model.dtype
+
+        self.intialize_parameters(clip_model)
+
+    def forward(self, prompts):
+        x = self.token_embedding(prompts).type(self.dtype)
+        x = x + self.positional_embedding.type(self.dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.ln_final(x).type(self.dtype)
+
+        # x.shape = [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        x = x[torch.arange(x.shape[0]), prompts.argmax(dim=-1)] @ self.text_projection
+        return x
+    
+    def intialize_parameters(self, clip_model):
+        if self.text_projection is not None:
+            nn.init.normal_(self.text_projection, std = clip_model.transformer.width ** -0.5)
+
 
 class depthwise_conv(nn.Module):
     def __init__(self, kernel_size=3, stride=1, padding=1):
@@ -69,6 +101,31 @@ class bottleneck_block(nn.Module):
         if act:
             x = self.activation(x)
         return x
+
+class Attention(nn.Module):
+    def __init__(self, d_model):
+        super(Attention, self).__init__()
+        self.d_model = d_model
+        self.q_linear = nn.Linear(d_model, d_model)
+        self.k_linear = nn.Linear(d_model, d_model)
+        self.v_linear = nn.Linear(d_model, d_model)
+
+        self.out = nn.Linear(d_model, d_model)
+
+        self.d_k = d_model
+    
+    def forward(self, q, k, v):
+        k = self.k_linear(k)
+        q = self.q_linear(q)
+        v = self.v_linear(v)
+        
+        attention_score = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.d_k)
+        attention_prob = torch.softmax(attention_score, dim=-1)
+        out = torch.matmul(attention_prob, v)
+
+        out = self.out(out)
+
+        return out
 
 
 
@@ -175,28 +232,34 @@ def build_layer(in_channels, out_channels, type, **kwargs):
     else:
         raise NotImplementedError(type)
 
-# def convert_models_to_fp32(model): 
-#     for p in model.parameters(): 
-#         p.data = p.data.float() 
-#         # p.grad.data = p.grad.data.float() 
+def convert_models_to_fp32(model): 
+    for p in model.parameters(): 
+        p.data = p.data.float() 
+        # p.grad.data = p.grad.data.float() 
 
 
 @HEADS.register_module()
-class BertHead(BaseDecodeHead):
+class CMFHead(BaseDecodeHead):
     def __init__(self, class_names, tau, arch_option, block_depth, activation, **kwargs):
         self.class_names = class_names
         self.tau = tau
-        super(BertHead, self).__init__(
+        super(CMFHead, self).__init__(
             input_transform='multiple_select', **kwargs)
 
-
-        self.bert_model = BertModel.from_pretrained("bert-base-uncased")
-        self.bert_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+        # self.clip_text_encoder, _ = clip.load('ViT-B/32' ,jit=False)
+        clip_model , _ = clip.load('RN50x16', device='cpu', jit=False)
+        convert_models_to_fp32(clip_model)
         
-        self.bert_model.to('cuda')
-        
-        for p in self.bert_model.parameters():
+        for p in clip_model.parameters():
             p.requires_grad = False
+
+        decoder_params = kwargs['decoder_params']
+        embed_dims = decoder_params['embed_dims']
+        final_embed_dim = embed_dims
+        
+        
+        self.clip_text_encoder = TextEncoder(clip_model, final_embed_dim)
+        # self.attn = Attention(final_embed_dim)
 
         self.block_depth = block_depth
 
@@ -207,9 +270,6 @@ class BertHead(BaseDecodeHead):
             self.spatial_block = depthwise_block(activation=activation)
 
         assert not self.align_corners
-        decoder_params = kwargs['decoder_params']
-        embed_dims = decoder_params['embed_dims']
-        final_embed_dim = embed_dims
         if isinstance(embed_dims, int):
             embed_dims = [embed_dims] * len(self.in_index)
         embed_cfg = decoder_params['embed_cfg']
@@ -240,27 +300,19 @@ class BertHead(BaseDecodeHead):
         for idx in range(len(self.class_names)):
             if self.class_names[idx] == 'person':
                 self.class_names[idx] = 'pedestrian'
-            elif self.class_names[idx] == 'rider':
-                self.class_names[idx] = 'driver'
             elif self.class_names[idx] == 'bicycle':
                 self.class_names[idx] = 'bike'
             elif self.class_names[idx] == 'motorcycle':
                 self.class_names[idx] = 'motorbike'
         
-        prompts = [f"a photo of a {name}, from street view." for name in self.class_names]
+        prompts = [f"a photo of a {name}." for name in self.class_names]
 
-        self.text = self.bert_tokenizer(prompts, padding=True, return_tensors="pt")
-        # self.text = clip.tokenize(self.class_names)
+        self.text = clip.tokenize(prompts)
         
-        self.transformer_width = self.bert_model.config.hidden_size
+        self.transformer_width = self.clip_text_encoder.transformer.width
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / self.tau)).exp()
-        self.text_projection = nn.Parameter(torch.empty(self.transformer_width, final_embed_dim))
 
-        self.intialize_parameters()
-
-    def intialize_parameters(self):
-        if self.text_projection is not None:
-            nn.init.normal_(self.text_projection, std = self.transformer_width ** -0.5)
+        del clip_model
 
     def forward(self, inputs):
         x = inputs
@@ -286,22 +338,22 @@ class BertHead(BaseDecodeHead):
                     align_corners=self.align_corners)
         
         x = self.fuse_layer(torch.cat(list(_c.values()), dim=1))
+        # x = self.image_text_attention(x)
         x = self.cls_seg(x)
 
         return x
 
     def cls_seg(self, feat):
         """Classify each pixel."""
-        if self.dropout is not None:
-            feat = self.dropout(feat)
+        # if self.dropout is not None:
+        #     feat = self.dropout(feat)
 
         text = self.text.to(feat.device)
         self.logit_scale = self.logit_scale.to(feat.device)
 
         with torch.no_grad():
-            bert_outputs = self.bert_model(**text)
-            cls_token = bert_outputs.pooler_output
-            text_features = cls_token @ self.text_projection
+            self.clip_text_encoder.eval()
+            text_features = self.clip_text_encoder(text)
 
         imshape = feat.shape
         image_features = feat.permute(0, 2, 3, 1).reshape(-1, imshape[1])

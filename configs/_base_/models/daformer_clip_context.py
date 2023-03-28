@@ -14,7 +14,7 @@ model = dict(
     pretrained='pretrained/mit_b5.pth',
     backbone=dict(type='mit_b5', style='pytorch'),
     clip_head=dict(
-        type='LsegHeadContext',
+        type='CMFHeadContext',
         in_channels=[64, 128, 320, 512],
         in_index=[0, 1, 2, 3],
         channels=512,
