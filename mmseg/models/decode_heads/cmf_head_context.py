@@ -376,7 +376,8 @@ class CMFHeadContext(BaseDecodeHead):
         
 
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
-        self.conv_seg = nn.Conv2d(self.channels + self.num_classes, self.num_classes, 1)
+        self.conv_proj = nn.Conv2d(self.channels + self.num_classes, self.channels, kernel_size=3, padding=1)
+        self.conv_seg = nn.Conv2d(self.channels, self.num_classes, 1)
 
         del clip_model
 
@@ -474,12 +475,8 @@ class CMFHeadContext(BaseDecodeHead):
 
         out = torch.stack(logits)
 
-        # out = self.convproj(out)
+        out = self.convproj(out)
         
-        # if self.arch_option in [1,2]:
-        #     for _ in range(self.block_depth - 1):
-        #         out = self.spatial_block(out)
-        #     out = self.spatial_block(out, False)
 
         if self.dropout is not None:
             out = self.dropout(out)
