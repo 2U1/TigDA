@@ -35,7 +35,7 @@ This code is based on mmsegmentation
 To use this code, please first install the 'mmcv-full' by following the official guideline guidelines ([`mmcv`](https://github.com/open-mmlab/mmcv/blob/master/README.md)).
 
 
-The requqirements can be installed by the following command
+The requirements can be installed by the following command
 ```shell
 pip install -r requirements.txt -f https://download.pytorch.org/whl/torch_stable.html
 ```
