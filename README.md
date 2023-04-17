@@ -1,6 +1,6 @@
 # TigDA
 
-This repository contains the official code for 
+This repository contains the official code for <br>
 "Enhancing Discriminative Ability among Similar Classes with Guidance of Text-Image Correlation for Unsupervised Domain Adaptation" (IJCNN 2023)
 
 The codes are based on mmsegmentation
