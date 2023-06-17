@@ -1,7 +1,7 @@
 # TigDA
 
 This repository contains the official code for <br>
-**"Enhancing Discriminative Ability among Similar Classes with Guidance of Text-Image Correlation for Unsupervised Domain Adaptation" (IJCNN 2023)**
+**"Enhancing Discriminative Ability among Similar Classes with Guidance of Text-Image Correlation for Unsupervised Domain Adaptation" (IJCNN 2023 Oral Presentation)**
 
 ## Overview
  In deep learning, unsupervised domain adaptation (UDA) is commonly utilized when the availability of abundant labeled data is often limited. Several methods have been proposed for UDA to overcome the difficulty of distinguishing between semantically similar classes, such as *person* vs. *rider* and *road* vs. *sidewalk*. The confusion of the classes results from the collapse of the distance, caused by the domain shift, between classes in the feature space. 
